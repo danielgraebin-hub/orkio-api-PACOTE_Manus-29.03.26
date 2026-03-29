@@ -5471,9 +5471,28 @@ async def chat_stream(
                 yield sse_event("status", {"phase": "agent", "agent_id": ag_id, "agent_name": ag_name, "agent": ag_name, "status": f"Executando @{ag_name}...", "trace_id": trace_id})
 
                 # Build context/prompt and run blocking LLM call in a background thread (major throughput win)
+                # Patch C: resolve agent file_ids for RAG scoping (aligned with /api/chat sync)
                 agent_file_ids = []
-                rag_top_k = ag_rag_top_k
-                effective_top_k = int(top_k or 0) if top_k else rag_top_k
+                if ag_id and ag_rag_enabled:
+                    try:
+                        linked_ids = get_linked_agent_ids(db, org, ag_id)
+                        scope_ids = [ag_id] + linked_ids
+                        agent_file_ids = get_agent_file_ids(db, org, scope_ids)
+                        if tid:
+                            thread_fids = [
+                                r[0] for r in db.execute(
+                                    select(File.id).where(
+                                        File.org_slug == org,
+                                        File.scope_thread_id == tid,
+                                        File.origin == "chat",
+                                    )
+                                ).all()
+                            ]
+                            if thread_fids:
+                                agent_file_ids = list(dict.fromkeys(agent_file_ids + thread_fids))
+                    except Exception:
+                        pass
+                effective_top_k = ag_rag_top_k or int(top_k or 6)
                 try:
                     citations = keyword_retrieve(db, org, message, file_ids=agent_file_ids, top_k=effective_top_k)
                 except Exception:
@@ -5484,12 +5503,20 @@ async def chat_stream(
                 model_override = ag_model
                 temperature = float(ag_temperature_raw if ag_temperature_raw not in (None, "") else 0.2) or 0.2
 
+                # Patch D: convert ORM Message objects to dicts for _openai_answer (aligned with /api/chat sync)
+                history_dicts = []
+                for pm in prev[-24:]:
+                    role = "assistant" if getattr(pm, "role", "") == "assistant" else ("system" if getattr(pm, "role", "") == "system" else "user")
+                    content = getattr(pm, "content", "") or ""
+                    if role and content:
+                        history_dicts.append({"role": role, "content": content})
+
                 llm_task = asyncio.create_task(
                     asyncio.to_thread(
                         _openai_answer,
                         message if blocked_reply is None else blocked_reply,
                         citations,
-                        prev,
+                        history_dicts,
                         system_prompt,
                         model_override,
                         temperature,
