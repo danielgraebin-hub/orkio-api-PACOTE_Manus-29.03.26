@@ -6080,7 +6080,7 @@ async def realtime_client_secret(
     auto_response_enabled = str(
         os.getenv(
             "OPENAI_REALTIME_AUTO_RESPONSE_ENABLED",
-            os.getenv("REALTIME_AUTO_RESPONSE_ENABLED", "true"),
+            os.getenv("REALTIME_AUTO_RESPONSE_ENABLED", "false"),
         )
     ).strip().lower() not in {"0", "false", "no", "off"}
 
