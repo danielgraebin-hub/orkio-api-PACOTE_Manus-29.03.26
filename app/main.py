@@ -5383,7 +5383,7 @@ async def chat_stream(
         target_agents_rows = list(
             db.execute(
                 select(Agent)
-                .where(Agent.org_slug == org, Agent.active == True)
+                .where(Agent.org_slug == org)
                 .order_by(Agent.created_at.asc())
             ).scalars().all()
         )
