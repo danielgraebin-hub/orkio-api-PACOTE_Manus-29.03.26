@@ -5484,12 +5484,20 @@ async def chat_stream(
                 model_override = ag_model
                 temperature = float(ag_temperature_raw if ag_temperature_raw not in (None, "") else 0.2) or 0.2
 
+                # Patch D: convert ORM Message objects to dicts for _openai_answer
+                history_dicts = []
+                for pm in prev[-24:]:
+                    role = getattr(pm, "role", "") or ""
+                    content = getattr(pm, "content", "") or ""
+                    if role and content:
+                        history_dicts.append({"role": role, "content": content})
+
                 llm_task = asyncio.create_task(
                     asyncio.to_thread(
                         _openai_answer,
                         message if blocked_reply is None else blocked_reply,
                         citations,
-                        prev,
+                        history_dicts,
                         system_prompt,
                         model_override,
                         temperature,
