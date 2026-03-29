@@ -4245,12 +4245,12 @@ async def upload(
                     existing = db.execute(
                         select(AgentKnowledge).where(
                             AgentKnowledge.org_slug == org,
-                            AgentKnowledge.agent_id == ag_id,
+                            AgentKnowledge.agent_id == ag.id,
                             AgentKnowledge.file_id == f.id,
                         )
                     ).scalar_one_or_none()
                     if not existing:
-                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag_id, file_id=f.id, created_at=now_ts()))
+                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
                 db.commit()
 
             # Explicit multi-agent linking
@@ -4262,12 +4262,12 @@ async def upload(
                     existing = db.execute(
                         select(AgentKnowledge).where(
                             AgentKnowledge.org_slug == org,
-                            AgentKnowledge.agent_id == ag_id,
+                            AgentKnowledge.agent_id == ag.id,
                             AgentKnowledge.file_id == f.id,
                         )
                     ).scalar_one_or_none()
                     if not existing:
-                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag_id, file_id=f.id, created_at=now_ts()))
+                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
                 db.commit()
 
             # Single-agent link (legacy)
@@ -4277,12 +4277,12 @@ async def upload(
                     existing = db.execute(
                         select(AgentKnowledge).where(
                             AgentKnowledge.org_slug == org,
-                            AgentKnowledge.agent_id == ag_id,
+                            AgentKnowledge.agent_id == ag.id,
                             AgentKnowledge.file_id == f.id,
                         )
                     ).scalar_one_or_none()
                     if not existing:
-                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag_id, file_id=f.id, created_at=now_ts()))
+                        db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
                     db.commit()
         except Exception:
             pass
@@ -4722,12 +4722,12 @@ def admin_approve_file_request(req_id: str, _admin=Depends(require_admin_access)
         existing = db.execute(
             select(AgentKnowledge).where(
                 AgentKnowledge.org_slug == org,
-                AgentKnowledge.agent_id == ag_id,
+                AgentKnowledge.agent_id == ag.id,
                 AgentKnowledge.file_id == f.id,
             )
         ).scalar_one_or_none()
         if not existing:
-            db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag_id, file_id=f.id, created_at=now_ts()))
+            db.add(AgentKnowledge(id=new_id(), org_slug=org, agent_id=ag.id, file_id=f.id, created_at=now_ts()))
 
     r.status = "approved"
     r.resolved_at = now_ts()

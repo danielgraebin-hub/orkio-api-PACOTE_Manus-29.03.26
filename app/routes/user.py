@@ -94,7 +94,8 @@ class OnboardingIn(BaseModel):
 
 def _complete_onboarding(inp: OnboardingIn, user: Dict[str, Any], db: Session):
     uid = user.get("sub")
-    u = db.execute(select(User).where(User.id == uid)).scalar_one_or_none()
+    org = user.get("org") or user.get("org_slug") or ""
+    u = db.execute(select(User).where(User.id == uid, User.org_slug == org)).scalar_one_or_none()
     if not u:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
