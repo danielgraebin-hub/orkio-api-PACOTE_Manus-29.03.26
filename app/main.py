@@ -5575,6 +5575,7 @@ async def chat_stream(
                         role="assistant",
                         content=ans,
                         agent_id=ag_id,
+                        created_at=now_ts(),
                     )
                     db.add(m_ass)
                     db.commit()
