@@ -3115,8 +3115,8 @@ def login(inp: LoginIn, x_org_slug: Optional[str] = Header(default=None), db: Se
             otp_for_admins,
         )
         try:
-            import random
-            otp_plain = f"{random.randint(0, 999999):06d}"
+            import secrets
+            otp_plain = f"{secrets.randbelow(1000000):06d}"
             otp_hash = hashlib.sha256(otp_plain.encode()).hexdigest()
             expires = now_ts() + 600  # 10 minutes
 
@@ -3770,14 +3770,17 @@ def chat(
     if not db_user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    # FASE3-PATCH-K: rate limiting por user_id
+    uid = user.get("sub")
+    if not _rate_limit_check(_rl_chat_lock, _rl_chat_calls, uid, _CHAT_MAX_PER_MINUTE):
+        raise HTTPException(status_code=429, detail="Limite de mensagens atingido. Aguarde 1 minuto.")
+
     # HOTFIX:
     # Do not block text chat for users still finishing onboarding inside the console.
     # Keep blocking only real approval problems.
     auth_status = _auth_status_for_user(db_user)
     if db_user.role != "admin" and auth_status == "pending_approval":
         raise HTTPException(status_code=403, detail="User pending approval")
-
-    uid = user.get("sub")
 
     # Ensure thread (create if new, ACL-check if existing)
     tid = inp.thread_id
@@ -5326,6 +5329,10 @@ async def chat_stream(
     org = _resolve_org(user, x_org_slug)
     uid = user.get("sub")
 
+    # FASE3-PATCH-K: rate limiting por user_id
+    if not _rate_limit_check(_rl_chat_lock, _rl_chat_calls, uid, _CHAT_MAX_PER_MINUTE):
+        raise HTTPException(status_code=429, detail="Limite de mensagens atingido. Aguarde 1 minuto.")
+
     # Input normalization
     message = (inp.message or "").strip()
     if not message:
@@ -6169,6 +6176,10 @@ async def realtime_start(
     if db_user.role != "admin" and not bool(getattr(db_user, "onboarding_completed", False)):
         raise HTTPException(status_code=403, detail="Onboarding incomplete")
     uid = user.get("sub")
+
+    # FASE3-PATCH-K: rate limiting por user_id
+    if not _rate_limit_check(_rl_realtime_lock, _rl_realtime_calls, uid, _REALTIME_MAX_PER_MINUTE):
+        raise HTTPException(status_code=429, detail="Limite de sess\u00f5es realtime atingido. Aguarde 1 minuto.")
     uname = user.get("name")
 
     # Resolve thread
@@ -7071,8 +7082,8 @@ def otp_request(inp: OtpRequestIn, request: Request = None, db: Session = Depend
         return {"ok": True, "message": "Se o email estiver cadastrado, você receberá o código."}
 
     # Generate 6-digit OTP
-    import random
-    otp_plain = f"{random.randint(0, 999999):06d}"
+    import secrets
+    otp_plain = f"{secrets.randbelow(1000000):06d}"
     otp_hash = hashlib.sha256(otp_plain.encode()).hexdigest()
     expires = now_ts() + 600  # 10 minutes
 
