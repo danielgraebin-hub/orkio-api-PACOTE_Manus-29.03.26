@@ -6122,11 +6122,16 @@ async def realtime_client_secret(
         )
     ).strip().lower() not in {"0", "false", "no", "off"}
 
-    summit_runtime = bool(mode == "summit" or os.getenv("SUMMIT_MODE", "false").strip().lower() in {"1", "true", "yes", "on"} or os.getenv("ORKIO_RUNTIME_MODE", "").strip().lower() == "summit")
+    summit_runtime = bool(
+        mode == "summit"
+        or response_profile == "stage"
+        or os.getenv("SUMMIT_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+        or os.getenv("ORKIO_RUNTIME_MODE", "").strip().lower() == "summit"
+    )
     resolved_create_response = False if summit_runtime else bool(auto_response_enabled)
 
     if summit_runtime:
-        resolved_language = "pt-BR"
+        resolved_language = resolve_stt_language(summit_cfg.get("transcription_language") or language_profile or os.getenv("SUMMIT_DEFAULT_LANGUAGE", "pt")) or "pt"
         if instructions:
             instructions = (instructions + "\n\nResponder sempre em português do Brasil.").strip()
         else:
