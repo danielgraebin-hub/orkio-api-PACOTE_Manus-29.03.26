@@ -6470,6 +6470,7 @@ def realtime_events_batch(
             if item.is_final and event_type == "transcript.final":
                 punct_ids.append(eid)
             if item.is_final and content and event_type in ("transcript.final", "response.final"):
+                message_created_at = ts if isinstance(ts, int) and ts > 0 else int(now_ts())
                 message_rows.append(
                     Message(
                         id=new_id(),
@@ -6481,7 +6482,7 @@ def realtime_events_batch(
                         content=content,
                         agent_id=agent_id if item.role != "user" else None,
                         agent_name=agent_name if item.role != "user" else None,
-                        created_at=ts,
+                        created_at=message_created_at,
                     )
                 )
         except Exception:
