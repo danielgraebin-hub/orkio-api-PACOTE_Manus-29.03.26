@@ -61,6 +61,11 @@ class Message(Base):
     client_message_id = Column(String, nullable=True)
     created_at = Column(BigInteger, nullable=False, default=_now_ts)
 
+    def __init__(self, **kwargs):
+        if "created_at" not in kwargs or kwargs["created_at"] is None:
+            kwargs["created_at"] = _now_ts()
+        super().__init__(**kwargs)
+
 class File(Base):
     __tablename__ = "files"
     id = Column(String, primary_key=True)
