@@ -1,6 +1,11 @@
 from __future__ import annotations
+import time
 from sqlalchemy import Column, String, Text, BigInteger, Integer, LargeBinary, Boolean, Numeric, UniqueConstraint, CheckConstraint, Index
 from .db import Base
+
+def _now_ts():
+    """Return current epoch seconds as int. Used as ORM column default."""
+    return int(time.time())
 
 class User(Base):
     __tablename__ = "users"
@@ -54,7 +59,7 @@ class Message(Base):
     agent_id = Column(String, nullable=True)
     agent_name = Column(String, nullable=True)
     client_message_id = Column(String, nullable=True)
-    created_at = Column(BigInteger, nullable=False)
+    created_at = Column(BigInteger, nullable=False, default=_now_ts)
 
 class File(Base):
     __tablename__ = "files"
