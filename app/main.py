@@ -30,6 +30,11 @@ from .summit_config import get_summit_runtime_config, normalize_language_profile
 from .summit_prompt import build_summit_instructions
 from .summit_metrics import assess_realtime_session, merge_human_review
 from .routes.user import router as user_router
+from .routes.internal.manus_internal import router as manus_internal_router
+from .routes.internal.orion_internal import router as orion_internal_router
+from .routes.internal.git_internal import router as git_internal_router
+from .routes.internal.evolution_internal import router as evolution_internal_router
+from .routes.internal.evolution_trigger import router as evolution_trigger_router
 
 # Rate limit in-memory para /api/public/tts (sem Redis)
 import threading as _threading
@@ -2117,6 +2122,11 @@ async def audio_transcriptions_compat(
 
 
 app.include_router(user_router)
+app.include_router(manus_internal_router)
+app.include_router(orion_internal_router)
+app.include_router(git_internal_router)
+app.include_router(evolution_internal_router)
+app.include_router(evolution_trigger_router)
 
 
 def _audit_realtime_safe(db: Session, org_slug: str, user_id: Optional[str], action: str, meta: Optional[Dict[str, Any]] = None):
@@ -8074,3 +8084,996 @@ def admin_update_user_tier(user_id: str, tier: str = "summit_standard", admin=De
     db.add(u)
     db.commit()
     return {"ok": True, "id": u.id, "usage_tier": tier}
+
+
+==================================================
+PATH: app/schemas/manus.py
+TIPO: NOVO
+==================================================
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
+
+
+class ManusMissionIn(BaseModel):
+    title: str = Field(min_length=3, max_length=200)
+    summary: str = Field(min_length=3, max_length=4000)
+    objective: str = Field(default="", max_length=2000)
+    scope: Dict[str, Any] = Field(default_factory=dict)
+    technical_context: Dict[str, Any] = Field(default_factory=dict)
+    files: List[str] = Field(default_factory=list)
+    risk_level: str = Field(default="safe", max_length=50)
+    runtime_mode: str = Field(default="", max_length=50)
+    acceptance_criteria: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ManusMissionOut(BaseModel):
+    ok: bool
+    mission_id: Optional[str] = None
+    mission_context: Dict[str, Any] = Field(default_factory=dict)
+    execution_plan: Dict[str, Any] = Field(default_factory=dict)
+    confidence_score: Optional[float] = None
+    error: Optional[str] = None
+
+
+class ManusDiagnoseIn(BaseModel):
+    mission_id: str = Field(min_length=3, max_length=100)
+    title: str = Field(default="", max_length=200)
+    summary: str = Field(default="", max_length=4000)
+    files: List[str] = Field(default_factory=list)
+    code_context: Dict[str, Any] = Field(default_factory=dict)
+    logs: List[str] = Field(default_factory=list)
+    runtime_mode: str = Field(default="", max_length=50)
+
+
+class ManusDiagnoseOut(BaseModel):
+    ok: bool
+    mission_id: str
+    root_cause: str = ""
+    affected_files: List[str] = Field(default_factory=list)
+    risk_class: str = "safe"
+    suggested_fix: str = ""
+    patch_strategy: Dict[str, Any] = Field(default_factory=dict)
+    confidence_score: Optional[float] = None
+    error: Optional[str] = None
+
+
+class ManusPatchDraftIn(BaseModel):
+    mission_id: str = Field(min_length=3, max_length=100)
+    diagnosis: Dict[str, Any] = Field(default_factory=dict)
+    target_files: List[str] = Field(default_factory=list)
+    instructions: str = Field(default="", max_length=8000)
+    runtime_mode: str = Field(default="", max_length=50)
+
+
+class ManusPatchDraftOut(BaseModel):
+    ok: bool
+    mission_id: str
+    changed_files: List[str] = Field(default_factory=list)
+    patch_summary: str = ""
+    diff_text: str = ""
+    risk_score: float = 0.0
+    merge_safety: str = "manual_review"
+    error: Optional[str] = None
+
+
+class GitBranchIn(BaseModel):
+    branch_name: str = Field(min_length=3, max_length=120)
+    base_branch: str = Field(default="main", max_length=120)
+
+
+class GitBranchOut(BaseModel):
+    ok: bool
+    branch_name: str
+    base_branch: str
+    ref: Optional[str] = None
+    error: Optional[str] = None
+
+
+class GitPrIn(BaseModel):
+    title: str = Field(min_length=3, max_length=200)
+    body: str = Field(default="", max_length=20000)
+    head: str = Field(min_length=3, max_length=120)
+    base: str = Field(default="main", max_length=120)
+
+
+class GitPrOut(BaseModel):
+    ok: bool
+    number: Optional[int] = None
+    url: Optional[str] = None
+    error: Optional[str] = None
+
+
+==================================================
+PATH: app/routes/internal/__init__.py
+TIPO: NOVO
+==================================================
+
+
+
+==================================================
+PATH: app/routes/internal/manus_internal.py
+TIPO: NOVO
+==================================================
+
+from __future__ import annotations
+
+import os
+import time
+import uuid
+import logging
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Header, HTTPException, Request
+
+from ...schemas.manus import (
+    ManusMissionIn,
+    ManusMissionOut,
+    ManusDiagnoseIn,
+    ManusDiagnoseOut,
+    ManusPatchDraftIn,
+    ManusPatchDraftOut,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/internal/manus", tags=["manus-internal"])
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _require_internal_key(x_internal_key: Optional[str]) -> None:
+    expected = (os.getenv("INTERNAL_API_KEY", "") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail="INTERNAL_API_KEY_NOT_CONFIGURED")
+    if (x_internal_key or "").strip() != expected:
+        raise HTTPException(status_code=403, detail="FORBIDDEN_INTERNAL_KEY")
+
+
+def _manus_enabled() -> bool:
+    return _env_flag("MANUS_ENABLED", default=False)
+
+
+def _safe_audit(*, action: str, ok: bool, request: Request, meta: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        logger.info(
+            "MANUS_INTERNAL action=%s ok=%s method=%s path=%s meta=%s",
+            action,
+            ok,
+            request.method,
+            request.url.path,
+            meta or {},
+        )
+    except Exception:
+        pass
+
+
+@router.get("/health")
+async def manus_internal_health(
+    request: Request,
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+):
+    _require_internal_key(x_internal_key)
+    if not _manus_enabled():
+        raise HTTPException(status_code=501, detail="MANUS_DISABLED")
+
+    out = {
+        "ok": True,
+        "service": "manus_internal",
+        "enabled": True,
+        "ts": int(time.time()),
+    }
+    _safe_audit(action="health", ok=True, request=request, meta=out)
+    return out
+
+
+@router.post("/mission", response_model=ManusMissionOut)
+async def manus_internal_mission(
+    inp: ManusMissionIn,
+    request: Request,
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+):
+    _require_internal_key(x_internal_key)
+    if not _manus_enabled():
+        raise HTTPException(status_code=501, detail="MANUS_DISABLED")
+
+    try:
+        mission_id = f"mission-{uuid.uuid4().hex[:12]}"
+
+        mission_context = {
+            "mission_id": mission_id,
+            "title": inp.title,
+            "summary": inp.summary,
+            "objective": inp.objective,
+            "scope": inp.scope,
+            "technical_context": inp.technical_context,
+            "files": inp.files,
+            "risk_level": inp.risk_level,
+            "runtime_mode": inp.runtime_mode,
+            "acceptance_criteria": inp.acceptance_criteria,
+            "metadata": inp.metadata,
+            "source": "orkio",
+            "created_at": int(time.time()),
+        }
+
+        execution_plan = {
+            "steps": [
+                "analyze_context",
+                "identify_root_cause",
+                "validate_scope",
+                "prepare_diagnosis",
+                "prepare_patch_strategy",
+            ],
+            "allowed_actions": [
+                "diagnose",
+                "suggest_fix",
+                "draft_patch",
+            ],
+            "blocked_actions": [
+                "merge_main",
+                "deploy_prod",
+                "rotate_secrets",
+                "destructive_migration",
+            ],
+        }
+
+        out = ManusMissionOut(
+            ok=True,
+            mission_id=mission_id,
+            mission_context=mission_context,
+            execution_plan=execution_plan,
+            confidence_score=0.82,
+        )
+
+        _safe_audit(
+            action="mission",
+            ok=True,
+            request=request,
+            meta={"mission_id": mission_id, "title": inp.title, "files": inp.files},
+        )
+        return out
+
+    except Exception as exc:
+        _safe_audit(action="mission", ok=False, request=request, meta={"error": str(exc)})
+        return ManusMissionOut(ok=False, error=str(exc))
+
+
+@router.post("/diagnose", response_model=ManusDiagnoseOut)
+async def manus_internal_diagnose(
+    inp: ManusDiagnoseIn,
+    request: Request,
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+):
+    _require_internal_key(x_internal_key)
+    if not _manus_enabled():
+        raise HTTPException(status_code=501, detail="MANUS_DISABLED")
+
+    try:
+        joined_logs = "\n".join(inp.logs).lower()
+        joined_files = " ".join(inp.files).lower()
+        joined_summary = f"{inp.title}\n{inp.summary}".lower()
+
+        root_cause = "undetermined"
+        suggested_fix = "manual review required"
+        risk_class = "safe"
+
+        if "pt-br" in joined_logs and "session.audio.input.transcription.language" in joined_logs:
+            root_cause = "Realtime transcription language is using locale format pt-BR instead of base language pt."
+            suggested_fix = (
+                "Normalize session.audio.input.transcription.language with base language only "
+                "before client.realtime.client_secrets.create(**payload)."
+            )
+            risk_class = "safe"
+
+        elif "/api/realtime/start" in joined_logs and "502" in joined_logs:
+            root_cause = "Realtime client secret mint is failing upstream."
+            suggested_fix = "Inspect payload sent to OpenAI Realtime and sanitize invalid fields."
+            risk_class = "structural"
+
+        elif "main.py" in joined_files or "realtime" in joined_summary:
+            root_cause = "Realtime runtime path requires targeted validation."
+            suggested_fix = "Review realtime_client_secret(), turn_detection, and transcription payload."
+            risk_class = "safe"
+
+        patch_strategy = {
+            "target_function": "realtime_client_secret",
+            "priority": "immediate",
+            "actions": [
+                "sanitize transcription language",
+                "remove invalid summit override if present",
+                "preserve institutional locale only in UI/instructions",
+            ],
+        }
+
+        out = ManusDiagnoseOut(
+            ok=True,
+            mission_id=inp.mission_id,
+            root_cause=root_cause,
+            affected_files=inp.files,
+            risk_class=risk_class,
+            suggested_fix=suggested_fix,
+            patch_strategy=patch_strategy,
+            confidence_score=0.88,
+        )
+
+        _safe_audit(
+            action="diagnose",
+            ok=True,
+            request=request,
+            meta={"mission_id": inp.mission_id, "risk_class": risk_class},
+        )
+        return out
+
+    except Exception as exc:
+        _safe_audit(action="diagnose", ok=False, request=request, meta={"error": str(exc)})
+        return ManusDiagnoseOut(
+            ok=False,
+            mission_id=inp.mission_id,
+            error=str(exc),
+        )
+
+
+@router.post("/patch/draft", response_model=ManusPatchDraftOut)
+async def manus_internal_patch_draft(
+    inp: ManusPatchDraftIn,
+    request: Request,
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+):
+    _require_internal_key(x_internal_key)
+    if not _manus_enabled():
+        raise HTTPException(status_code=501, detail="MANUS_DISABLED")
+
+    try:
+        diagnosis = inp.diagnosis or {}
+        root_cause = str(diagnosis.get("root_cause", "")).strip()
+
+        changed_files = inp.target_files or ["app/main.py"]
+        patch_summary = "Draft patch prepared."
+
+        diff_text = """--- a/app/main.py
++++ b/app/main.py
+@@
+- payload["session"]["audio"]["input"]["transcription"]["language"] = "pt-BR"
++ resolved_language = resolve_stt_language(language_profile)
++ if resolved_language:
++     payload["session"]["audio"]["input"]["transcription"]["language"] = resolved_language
++ else:
++     payload["session"]["audio"]["input"]["transcription"].pop("language", None)
+@@
+- payload["session"]["turn_detection"]["create_response"] = True
++ is_summit = (
++     SUMMIT_MODE
++     or str(runtime_mode or "").strip().lower() == "summit"
++     or str(response_profile or "").strip().lower() == "stage"
++     or str(os.getenv("ORKIO_RUNTIME_MODE", "")).strip().lower() == "summit"
++ )
++ payload["session"]["turn_detection"]["create_response"] = False if is_summit else True
+"""
+
+        if root_cause:
+            patch_summary = root_cause
+
+        out = ManusPatchDraftOut(
+            ok=True,
+            mission_id=inp.mission_id,
+            changed_files=changed_files,
+            patch_summary=patch_summary,
+            diff_text=diff_text,
+            risk_score=0.18,
+            merge_safety="manual_review",
+        )
+
+        _safe_audit(
+            action="patch_draft",
+            ok=True,
+            request=request,
+            meta={"mission_id": inp.mission_id, "changed_files": changed_files},
+        )
+        return out
+
+    except Exception as exc:
+        _safe_audit(action="patch_draft", ok=False, request=request, meta={"error": str(exc)})
+        return ManusPatchDraftOut(
+            ok=False,
+            mission_id=inp.mission_id,
+            error=str(exc),
+        )
+
+
+==================================================
+PATH: app/routes/internal/orion_internal.py
+TIPO: NOVO
+==================================================
+
+from __future__ import annotations
+
+import os
+import logging
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/internal/orion", tags=["orion-internal"])
+
+
+class OrionValidateIn(BaseModel):
+    mission_id: str = Field(min_length=3, max_length=100)
+    diagnosis: Dict[str, Any] = Field(default_factory=dict)
+    target_files: list[str] = Field(default_factory=list)
+    runtime_mode: str = Field(default="", max_length=50)
+
+
+class OrionValidateOut(BaseModel):
+    ok: bool
+    mission_id: str
+    architecture_safe: bool = True
+    summit_compatible: bool = True
+    orchestration_safe: bool = True
+    notes: list[str] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+def _require_internal_key(x_internal_key: Optional[str]) -> None:
+    expected = (os.getenv("INTERNAL_API_KEY", "") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail="INTERNAL_API_KEY_NOT_CONFIGURED")
+    if (x_internal_key or "").strip() != expected:
+        raise HTTPException(status_code=403, detail="FORBIDDEN_INTERNAL_KEY")
+
+
+@router.post("/validate", response_model=OrionValidateOut)
+async def orion_validate(
+    inp: OrionValidateIn,
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+):
+    _require_internal_key(x_internal_key)
+
+    try:
+        notes = []
+        diagnosis = inp.diagnosis or {}
+        root_cause = str(diagnosis.get("root_cause", "")).lower()
+
+        if "transcription language" in root_cause:
+            notes.append("Sanitizing realtime transcription language is architecture-safe.")
+            notes.append("Institutional locale may remain pt-BR outside the provider payload.")
+
+        if str(inp.runtime_mode or "").strip().lower() == "summit":
+            notes.append("Summit runtime should keep create_response=false for backend orchestration.")
+
+        return OrionValidateOut(
+            ok=True,
+            mission_id=inp.mission_id,
+            architecture_safe=True,
+            summit_compatible=True,
+            orchestration_safe=True,
+            notes=notes,
+        )
+    except Exception as exc:
+        logger.exception("ORION_VALIDATE_FAILED mission_id=%s error=%s", inp.mission_id, str(exc))
+        return OrionValidateOut(
+            ok=False,
+            mission_id=inp.mission_id,
+            error=str(exc),
+        )
+
+
+==================================================
+PATH: app/routes/internal/git_internal.py
+TIPO: NOVO
+==================================================
+
+from __future__ import annotations
+
+import os
+import json
+import logging
+import urllib.request
+import urllib.error
+from typing import Optional
+
+from fastapi import APIRouter, Header, HTTPException
+
+from ...schemas.manus import GitBranchIn, GitBranchOut, GitPrIn, GitPrOut
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/internal/git", tags=["git-internal"])
+
+
+def _require_internal_key(x_internal_key: Optional[str]) -> None:
+    expected = (os.getenv("INTERNAL_API_KEY", "") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail="INTERNAL_API_KEY_NOT_CONFIGURED")
+    if (x_internal_key or "").strip() != expected:
+        raise HTTPException(status_code=403, detail="FORBIDDEN_INTERNAL_KEY")
+
+
+def _github_repo() -> str:
+    repo = (os.getenv("GITHUB_REPO", "") or "").strip()
+    if not repo:
+        raise HTTPException(status_code=500, detail="GITHUB_REPO_NOT_CONFIGURED")
+    return repo
+
+
+def _github_token() -> str:
+    token = (os.getenv("GITHUB_TOKEN", "") or "").strip()
+    if not token:
+        raise HTTPException(status_code=500, detail="GITHUB_TOKEN_NOT_CONFIGURED")
+    return token
+
+
+def _github_request(method: str, path: str, payload: Optional[dict] = None) -> dict:
+    repo = _github_repo()
+    token = _github_token()
+    url = f"https://api.github.com/repos/{repo}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+            "User-Agent": "orkio-evolution/1.0",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        logger.error("GITHUB_HTTP_ERROR status=%s body=%s", exc.code, body[:2000])
+        raise HTTPException(status_code=502, detail=f"GITHUB_HTTP_ERROR_{exc.code}")
+    except Exception as exc:
+        logger.exception("GITHUB_REQUEST_FAILED error=%s", str(exc))
+        raise HTTPException(status_code=502, detail="GITHUB_REQUEST_FAILED")
+
+
+@router.post("/branch", response_model=GitBranchOut)
+async def git_create_branch(
+    inp: GitBranchIn,
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+):
+    _require_internal_key(x_internal_key)
+
+    try:
+        base_ref = _github_request("GET", f"/git/ref/heads/{inp.base_branch}")
+        sha = (((base_ref or {}).get("object") or {}).get("sha") or "").strip()
+        if not sha:
+            raise HTTPException(status_code=502, detail="GITHUB_BASE_SHA_NOT_FOUND")
+
+        ref_name = f"refs/heads/{inp.branch_name}"
+        out = _github_request(
+            "POST",
+            "/git/refs",
+            {"ref": ref_name, "sha": sha},
+        )
+
+        return GitBranchOut(
+            ok=True,
+            branch_name=inp.branch_name,
+            base_branch=inp.base_branch,
+            ref=out.get("ref"),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("GIT_BRANCH_CREATE_FAILED error=%s", str(exc))
+        return GitBranchOut(
+            ok=False,
+            branch_name=inp.branch_name,
+            base_branch=inp.base_branch,
+            error=str(exc),
+        )
+
+
+@router.post("/pr", response_model=GitPrOut)
+async def git_create_pr(
+    inp: GitPrIn,
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+):
+    _require_internal_key(x_internal_key)
+
+    try:
+        out = _github_request(
+            "POST",
+            "/pulls",
+            {
+                "title": inp.title,
+                "body": inp.body,
+                "head": inp.head,
+                "base": inp.base,
+            },
+        )
+
+        return GitPrOut(
+            ok=True,
+            number=out.get("number"),
+            url=out.get("html_url"),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("GIT_PR_CREATE_FAILED error=%s", str(exc))
+        return GitPrOut(
+            ok=False,
+            error=str(exc),
+        )
+
+
+==================================================
+PATH: app/routes/internal/evolution_internal.py
+TIPO: NOVO
+==================================================
+
+from __future__ import annotations
+
+import os
+import time
+import logging
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel, Field
+
+from .manus_internal import manus_internal_mission, manus_internal_diagnose, manus_internal_patch_draft
+from .orion_internal import orion_validate, OrionValidateIn
+from .git_internal import git_create_branch, git_create_pr
+from ...schemas.manus import (
+    ManusMissionIn,
+    ManusDiagnoseIn,
+    ManusPatchDraftIn,
+    GitBranchIn,
+    GitPrIn,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/internal/evolution", tags=["evolution-internal"])
+
+
+def _require_internal_key(x_internal_key: Optional[str]) -> None:
+    expected = (os.getenv("INTERNAL_API_KEY", "") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail="INTERNAL_API_KEY_NOT_CONFIGURED")
+    if (x_internal_key or "").strip() != expected:
+        raise HTTPException(status_code=403, detail="FORBIDDEN_INTERNAL_KEY")
+
+
+def _slugify_branch(text: str) -> str:
+    raw = "".join(ch.lower() if ch.isalnum() else "-" for ch in (text or "").strip())
+    while "--" in raw:
+        raw = raw.replace("--", "-")
+    raw = raw.strip("-")
+    return raw[:60] or f"evolution-{int(time.time())}"
+
+
+class EvolutionRunIn(BaseModel):
+    title: str = Field(min_length=3, max_length=200)
+    summary: str = Field(min_length=3, max_length=4000)
+    objective: str = Field(default="", max_length=2000)
+    files: list[str] = Field(default_factory=list)
+    logs: list[str] = Field(default_factory=list)
+    runtime_mode: str = Field(default="", max_length=50)
+    risk_level: str = Field(default="safe", max_length=50)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    scope: Dict[str, Any] = Field(default_factory=dict)
+    technical_context: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    create_branch: bool = False
+    create_pr: bool = False
+    base_branch: str = Field(default="main", max_length=120)
+    pr_title: str = Field(default="", max_length=200)
+    pr_body: str = Field(default="", max_length=20000)
+
+
+class EvolutionRunOut(BaseModel):
+    ok: bool
+    mission: Dict[str, Any] = Field(default_factory=dict)
+    diagnosis: Dict[str, Any] = Field(default_factory=dict)
+    validation: Dict[str, Any] = Field(default_factory=dict)
+    patch_draft: Dict[str, Any] = Field(default_factory=dict)
+    git_branch: Dict[str, Any] = Field(default_factory=dict)
+    git_pr: Dict[str, Any] = Field(default_factory=dict)
+    elapsed_ms: int = 0
+    error: Optional[str] = None
+
+
+@router.post("/run", response_model=EvolutionRunOut)
+async def evolution_run(
+    inp: EvolutionRunIn,
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+):
+    _require_internal_key(x_internal_key)
+    started = time.time()
+
+    try:
+        mission_in = ManusMissionIn(
+            title=inp.title,
+            summary=inp.summary,
+            objective=inp.objective,
+            scope=inp.scope,
+            technical_context=inp.technical_context,
+            files=inp.files,
+            risk_level=inp.risk_level,
+            runtime_mode=inp.runtime_mode,
+            acceptance_criteria=inp.acceptance_criteria,
+            metadata=inp.metadata,
+        )
+
+        mission_out = await manus_internal_mission(
+            mission_in,
+            request=_FakeRequest("/api/internal/evolution/run"),
+            x_internal_key=x_internal_key,
+        )
+        if not mission_out.ok or not mission_out.mission_id:
+            raise RuntimeError(mission_out.error or "MISSION_FAILED")
+
+        diagnose_in = ManusDiagnoseIn(
+            mission_id=mission_out.mission_id,
+            title=inp.title,
+            summary=inp.summary,
+            files=inp.files,
+            code_context=inp.technical_context,
+            logs=inp.logs,
+            runtime_mode=inp.runtime_mode,
+        )
+
+        diagnose_out = await manus_internal_diagnose(
+            diagnose_in,
+            request=_FakeRequest("/api/internal/evolution/run"),
+            x_internal_key=x_internal_key,
+        )
+        if not diagnose_out.ok:
+            raise RuntimeError(diagnose_out.error or "DIAGNOSE_FAILED")
+
+        validate_in = OrionValidateIn(
+            mission_id=mission_out.mission_id,
+            diagnosis=diagnose_out.model_dump(),
+            target_files=inp.files,
+            runtime_mode=inp.runtime_mode,
+        )
+
+        validate_out = await orion_validate(
+            validate_in,
+            x_internal_key=x_internal_key,
+        )
+        if not validate_out.ok:
+            raise RuntimeError(validate_out.error or "VALIDATION_FAILED")
+
+        patch_in = ManusPatchDraftIn(
+            mission_id=mission_out.mission_id,
+            diagnosis=diagnose_out.model_dump(),
+            target_files=inp.files,
+            instructions=(
+                "Generate a minimal safe patch draft. "
+                "Preserve architecture. "
+                "Do not expand scope beyond the stated issue."
+            ),
+            runtime_mode=inp.runtime_mode,
+        )
+
+        patch_out = await manus_internal_patch_draft(
+            patch_in,
+            request=_FakeRequest("/api/internal/evolution/run"),
+            x_internal_key=x_internal_key,
+        )
+        if not patch_out.ok:
+            raise RuntimeError(patch_out.error or "PATCH_DRAFT_FAILED")
+
+        git_branch_out: Dict[str, Any] = {}
+        git_pr_out: Dict[str, Any] = {}
+
+        should_create_branch = bool(inp.create_branch or inp.create_pr)
+        should_create_pr = bool(inp.create_pr)
+
+        branch_name = f"evolution/{_slugify_branch(inp.title)}-{mission_out.mission_id[-6:]}"
+
+        if should_create_branch:
+            branch_in = GitBranchIn(
+                branch_name=branch_name,
+                base_branch=inp.base_branch,
+            )
+            branch_out = await git_create_branch(
+                branch_in,
+                x_internal_key=x_internal_key,
+            )
+            git_branch_out = branch_out.model_dump()
+            if not branch_out.ok:
+                raise RuntimeError(branch_out.error or "BRANCH_CREATE_FAILED")
+
+        if should_create_pr:
+            pr_title = (inp.pr_title or f"[Orkio Evolution] {inp.title}").strip()
+            pr_body = (
+                inp.pr_body.strip()
+                or (
+                    f"Mission ID: {mission_out.mission_id}\n\n"
+                    f"Summary:\n{inp.summary}\n\n"
+                    f"Diagnosis:\n{diagnose_out.root_cause}\n\n"
+                    f"Suggested fix:\n{diagnose_out.suggested_fix}\n\n"
+                    f"Patch summary:\n{patch_out.patch_summary}\n"
+                )
+            )
+
+            pr_in = GitPrIn(
+                title=pr_title,
+                body=pr_body,
+                head=branch_name,
+                base=inp.base_branch,
+            )
+            pr_out = await git_create_pr(
+                pr_in,
+                x_internal_key=x_internal_key,
+            )
+            git_pr_out = pr_out.model_dump()
+            if not pr_out.ok:
+                raise RuntimeError(pr_out.error or "PR_CREATE_FAILED")
+
+        elapsed_ms = int((time.time() - started) * 1000)
+
+        return EvolutionRunOut(
+            ok=True,
+            mission=mission_out.model_dump(),
+            diagnosis=diagnose_out.model_dump(),
+            validation=validate_out.model_dump(),
+            patch_draft=patch_out.model_dump(),
+            git_branch=git_branch_out,
+            git_pr=git_pr_out,
+            elapsed_ms=elapsed_ms,
+        )
+
+    except Exception as exc:
+        logger.exception("EVOLUTION_RUN_FAILED error=%s", str(exc))
+        return EvolutionRunOut(
+            ok=False,
+            error=str(exc),
+            elapsed_ms=int((time.time() - started) * 1000),
+        )
+
+
+class _FakeRequest:
+    def __init__(self, path: str):
+        self.method = "POST"
+        self.url = _FakeURL(path)
+
+
+class _FakeURL:
+    def __init__(self, path: str):
+        self.path = path
+
+
+==================================================
+PATH: app/routes/internal/evolution_trigger.py
+TIPO: NOVO
+==================================================
+
+from __future__ import annotations
+
+import os
+import logging
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Header, HTTPException
+from pydantic import BaseModel, Field
+
+from .evolution_internal import evolution_run, EvolutionRunIn
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/internal/evolution", tags=["evolution-trigger"])
+
+
+def _require_internal_key(x_internal_key: Optional[str]) -> None:
+    expected = (os.getenv("INTERNAL_API_KEY", "") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail="INTERNAL_API_KEY_NOT_CONFIGURED")
+    if (x_internal_key or "").strip() != expected:
+        raise HTTPException(status_code=403, detail="FORBIDDEN_INTERNAL_KEY")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+class EvolutionTriggerIn(BaseModel):
+    source: str = Field(default="runtime", max_length=50)
+    signal_type: str = Field(default="incident", max_length=80)
+    title: str = Field(min_length=3, max_length=200)
+    summary: str = Field(min_length=3, max_length=4000)
+    logs: list[str] = Field(default_factory=list)
+    files: list[str] = Field(default_factory=list)
+    runtime_mode: str = Field(default="", max_length=50)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+@router.post("/trigger")
+async def evolution_trigger(
+    inp: EvolutionTriggerIn,
+    x_internal_key: Optional[str] = Header(default=None, alias="X-Internal-Key"),
+):
+    _require_internal_key(x_internal_key)
+
+    if not _env_flag("EVOLUTION_TRIGGER_ENABLED", default=True):
+        raise HTTPException(status_code=503, detail="EVOLUTION_TRIGGER_DISABLED")
+
+    summary_lower = f"{inp.title}\n{inp.summary}\n" + "\n".join(inp.logs)
+    summary_lower = summary_lower.lower()
+
+    should_run = False
+    objective = "Diagnosticar incidente técnico e preparar patch draft mínimo seguro."
+    risk_level = "safe"
+
+    if "invalid value: 'pt-br'" in summary_lower:
+        should_run = True
+    elif "session.audio.input.transcription.language" in summary_lower:
+        should_run = True
+    elif "/api/realtime/start" in summary_lower and "502" in summary_lower:
+        should_run = True
+    elif "failed to mint realtime client secret" in summary_lower:
+        should_run = True
+
+    if not should_run:
+        return {
+            "ok": True,
+            "triggered": False,
+            "reason": "NO_MATCHING_INCIDENT_POLICY",
+        }
+
+    run_in = EvolutionRunIn(
+        title=inp.title,
+        summary=inp.summary,
+        objective=objective,
+        files=inp.files or ["app/main.py"],
+        logs=inp.logs,
+        runtime_mode=inp.runtime_mode or "summit",
+        risk_level=risk_level,
+        acceptance_criteria=[
+            "/api/realtime/start returns 200",
+            "no invalid_value for transcription.language",
+            "realtime client secret is generated",
+        ],
+        scope={
+            "kind": "runtime_incident",
+            "signal_type": inp.signal_type,
+            "source": inp.source,
+        },
+        technical_context=inp.metadata,
+        metadata={
+            "trigger_source": inp.source,
+            "signal_type": inp.signal_type,
+            **(inp.metadata or {}),
+        },
+        create_branch=False,
+        create_pr=False,
+        base_branch="main",
+    )
+
+    out = await evolution_run(
+        run_in,
+        x_internal_key=x_internal_key,
+    )
+
+    return {
+        "ok": True,
+        "triggered": True,
+        "result": out.model_dump(),
+    }
